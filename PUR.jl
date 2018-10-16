@@ -4,12 +4,18 @@
 using CSV, DataFrames, DataFramesMeta
 using Gadfly
 using ZipFile
-
-# use ; in the REPL to move to shell mode
-# change working directory
-# cd "/Users/alejandromerchan/Pesticide_Use"
 using FTPClient
-function download_info(year1::Int, year2=nothing)
+#################################################################################
+
+#################################################################################
+## Loading data from CDPR FTP server.                                          ##
+#################################################################################
+"""
+    download_info(year1[, year2])
+
+Saves the zip files from CDPR server into your computer memory
+"""
+function download_files(year1::Int, year2=nothing)
     ftp_init()
     options = RequestOptions(hostname="transfer.cdpr.ca.gov/pub/outgoing/pur_archives/")
     global files = DataFrame(year = [], files = [])
@@ -30,20 +36,47 @@ function download_info(year1::Int, year2=nothing)
     ftp_cleanup()
     return files
 end
+#################################################################################
 
-################################################################################
-## Dealing with chemicals                                                     ##
-################################################################################
-# Function that loads different files from the zip files for a certain year in
-# a dataframe.
-# kind = :chemicals loads the file "chemical.txt", which contains a list with
-# all approved chemicals for each year and their chem_codes.
-# kind = :sites loads the file "site.txt", which contains a list with all sites
-# (commodities) that can be reported in CA for that year and their site_codes.
-# kind = :counties loads the the file "county.txt", which contains a list with
-# all counties in CA and their county_cd (codes).
+#################################################################################
+## Unzipping and loading files into memory                                      ##
+#################################################################################
+"""
+    get_files(year, kind)
+
+Unizips and loads the desires files from the zip file from the year and save it in
+a Dataframe.
+
+kind = :chemicals loads the file "chemical.txt", which contains a list with
+all approved chemicals for each year and their chem_codes.
+kind = :sites loads the file "site.txt", which contains a list with all sites
+(commodities) that can be reported in CA for that year and their site_codes.
+kind = :counties loads the the file "county.txt", which contains a list with
+all counties in CA and their county_cd (codes).
+"""
 function get_files(year::Int, kind::Symbol)
-    for i in 1:length(files.files)
+    for i in 1:length(files)
+        if files.year[i] == 2016
+            reading = ZipFile.Reader(files.files[i].body)
+            for i in 1:length(reading.files)
+                if kind == :chemicals && reading.files[i].name == "pur2016/chemical.txt"
+                    chemicals = CSV.read(IOBuffer(read(reading.files[i])))
+                    return chemicals
+                    break
+                end
+                if kind == :sites && reading.files[i].name == "pur2016/site.txt"
+                    sites = CSV.read(IOBuffer(read(reading.files[i])))
+                    return sites
+                    break
+                end
+                if kind == :counties && reading.files[i].name == "pur2016/county.txt"
+                    counties = CSV.read(IOBuffer(read(reading.files[i])))
+                    return counties
+                    break
+                end
+            end
+        end
+
         if files.year[i] == year
             reading = ZipFile.Reader(files.files[i].body)
             for i in 1:length(reading.files)
@@ -82,7 +115,7 @@ function compare_site_years(year1::Int, year2::Int)
 end
 
 # find sites using any word (site) as a string.
-function find_site_code(year::Int, site::AbstractString)
+function find_site_code(site::AbstractString, year::Int)
     sites = get_files(year, :sites)
     filtered = DataFrame(site_code=[], site_name=[])
     for i in 1:size(sites,1)
@@ -94,16 +127,9 @@ function find_site_code(year::Int, site::AbstractString)
     return filtered
 end
 
-################################################################################
-## Dealing with the PUR.txt file                                              ##
-################################################################################
-# Function to load file from disk
-# Takes the county code from the dict
-
-function load_pur(county_name::AbstractString, year::Int)
-    # Creates the dictionary with county codes
+# Extract the county code
+function find_county_code(county_name::AbstractString, year::Int)
     counties = get_files(year, :counties)
-    # Extract the county code
     county_code = []
     for i in 1:length(counties[:couty_name])
         if counties[i,2] == uppercase(county_name)
@@ -111,44 +137,67 @@ function load_pur(county_name::AbstractString, year::Int)
             break
         end
     end
-    # transform year into string
+    return county_code
+end
+
+################################################################################
+## Dealing with the PUR.txt file                                              ##
+################################################################################
+# Function to load pur file from disk, using the county name as a string and the year
+function load_pur(county_name::AbstractString, year::Int, dropmissing::Bool = false)
+    county_code = find_county_code(county_name, year)
+
     string_year = string(year)
-    pur = DataFrame()
+
+    pur = ()
     for i in 1:length(files.files)
+        if files.year[i] == 2016
+            reading = ZipFile.Reader(files.files[i].body)
+            for i in 1:length(reading.files)
+                if reading.files[i].name == "pur2016/udc" * string_year[3:4] * "_"* string(county_code) * ".txt"
+                    pur = CSV.File(IOBuffer(read(reading.files[i]))) #|> DataFrame
+                end
+            end
+        end
         if files.year[i] == year
             reading = ZipFile.Reader(files.files[i].body)
             for i in 1:length(reading.files)
                 if reading.files[i].name == "udc" * string_year[3:4] * "_"* string(county_code) * ".txt"
-                    pur = CSV.read(IOBuffer(read(reading.files[i])), escapechar = "#")
+                    pur = CSV.File(IOBuffer(read(reading.files[i]))) #|> DataFrame
                 end
             end
         end
     end
+
+    pur_df = DataFrame(pur)
+
+    pur_df = @select(pur_df, :use_no, :prodno, :chem_code, :prodchem_pct, :lbs_chm_used,
+    :lbs_prd_used, :amt_prd_used, :unit_of_meas, :acre_planted, :unit_planted,
+    :acre_treated, :unit_treated, :applic_cnt, :applic_dt, :grower_id, :site_code)
+
     # add column for year
-    pur[:year] = repeat([year], outer = size(pur, 1))
+    pur_df[:year] = repeat([year], outer = size(pur_df, 1))
 
     # add chem name
-    pur[:chem_name] = repeat(["0"],outer = size(pur, 1))
+    pur_df[:chem_name] = repeat(["0"],outer = size(pur_df, 1))
 
-    pur = @select(pur, :use_no, :prodno, :chem_code, :prodchem_pct, :lbs_chm_used,
-    :lbs_prd_used, :amt_prd_used, :unit_of_meas, :acre_planted, :unit_planted,
-    :acre_treated, :unit_treated, :applic_cnt, :applic_dt, :grower_id, :site_code,
-    :year, :chem_name)
-
-    pur = dropmissing!(pur)
+    if dropmissing == true
+        pur_df = dropmissing!(pur_df)
+    end
 
     chem_codes = get_files(year, :chemicals)
     chemcodes = Dict()
-
     for i in 1:size(chem_codes,1)
         push!(chemcodes, (chem_codes[i,1] => chem_codes[i,3]))
     end
 
-    for i in 1:size(pur,1)
-         chemical = pur[i,:chem_code]
-         pur[i,:chem_name] = chemcodes[chemical]
+    for i in 1:size(pur_df,1)
+        chemical = pur_df[i,:chem_code]
+        if typeof(chemical) != Missing
+            pur_df[i,:chem_name] = chemcodes[chemical]
+        end
     end
-    return pur
+    return pur_df
 end
 
 # Select a site code using the find_site_code function
